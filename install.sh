@@ -25,7 +25,7 @@ Environment variables:
   Exposure   SERVICE_TYPE PUBLIC_URL FUSION_TRUSTED_PROXIES FUSION_CORS_ALLOWED_ORIGINS
   OIDC      ENABLE_OIDC FUSION_OIDC_ISSUER FUSION_OIDC_CLIENT_ID
              FUSION_OIDC_CLIENT_SECRET FUSION_OIDC_REDIRECT_URI
-             FUSION_OIDC_ALLOWED_USER OIDC_ALLOW_ANY_USER
+             FUSION_OIDC_ALLOWED_USER OIDC_ALLOW_ANY_USER OIDC_ALLOW_HTTP_ISSUER
   Tuning     FUSION_FEVER_USERNAME FUSION_ALLOW_PRIVATE_FEEDS FUSION_PULL_INTERVAL
              FUSION_PULL_TIMEOUT FUSION_PULL_CONCURRENCY FUSION_PULL_MAX_BACKOFF
              FUSION_LOGIN_RATE_LIMIT FUSION_LOGIN_WINDOW FUSION_LOGIN_BLOCK
@@ -63,7 +63,9 @@ kv_get() { # file key
 
 kv_set() { # file key value; an empty value removes the key
   local file=$1 key=$2 value=${3-} tmp
-  [[ $value != *$'\n'* ]] || die "$key must not contain a newline"
+  # Kustomize env files mangle these (a trailing \r vanishes), so refuse rather
+  # than deploy a credential that differs from the one supplied.
+  [[ $value != *[[:cntrl:]]* ]] || die "$key must not contain control characters"
   tmp=$(mktemp "$file.XXXXXX")
   if [[ -f $file ]]; then grep -v "^$key=" "$file" >"$tmp" || true; fi
   if [[ -n $value ]]; then printf '%s=%s\n' "$key" "$value" >>"$tmp"; fi
@@ -150,9 +152,17 @@ check_oidc_issuer() {
 
 configure_oidc() {
   ask FUSION_OIDC_ISSUER "OIDC issuer URL" "$(kv_get "$CONFIG" FUSION_OIDC_ISSUER)"
-  ask FUSION_OIDC_CLIENT_ID "OIDC client ID" "$(kv_get "$CONFIG" FUSION_OIDC_CLIENT_ID)"
-  ask_secret FUSION_OIDC_CLIENT_SECRET "OIDC client secret (blank for a public PKCE client)" \
-    "$(kv_get "$SECRET" FUSION_OIDC_CLIENT_SECRET)"
+  # Saved answers only count for the issuer they were given for. A client secret
+  # or allowed user must not follow you to a different provider.
+  local saved_id='' saved_secret='' saved_user='' any_default=false
+  if [[ $FUSION_OIDC_ISSUER == "$(kv_get "$CONFIG" FUSION_OIDC_ISSUER)" ]]; then
+    saved_id=$(kv_get "$CONFIG" FUSION_OIDC_CLIENT_ID)
+    saved_secret=$(kv_get "$SECRET" FUSION_OIDC_CLIENT_SECRET)
+    saved_user=$(kv_get "$CONFIG" FUSION_OIDC_ALLOWED_USER)
+    any_default=$(kv_get "$INSTALL" OIDC_ALLOW_ANY_USER | grep -x true || echo false)
+  fi
+  ask FUSION_OIDC_CLIENT_ID "OIDC client ID" "$saved_id"
+  ask_secret FUSION_OIDC_CLIENT_SECRET "OIDC client secret (blank for a public PKCE client)" "$saved_secret"
 
   local default_redirect
   if [[ -n $PUBLIC_URL ]]; then
@@ -169,8 +179,9 @@ configure_oidc() {
   require_match FUSION_OIDC_ISSUER "$FUSION_OIDC_ISSUER" '^https?://[^[:space:]]+$' "an http(s) URL"
   require_match FUSION_OIDC_REDIRECT_URI "$FUSION_OIDC_REDIRECT_URI" \
     '^https?://[^/[:space:]]+(/api)?/oidc/callback$' "https://<host>/api/oidc/callback"
-  [[ $FUSION_OIDC_ISSUER == https://* ]] ||
-    warn "the issuer is not HTTPS, so tokens and the client secret travel unencrypted."
+  # Signing keys come from the issuer too, so plain HTTP risks more than eavesdropping.
+  [[ $FUSION_OIDC_ISSUER == https://* || ${OIDC_ALLOW_HTTP_ISSUER:-} == true ]] ||
+    die "the OIDC issuer must be HTTPS, because logins can't be trusted otherwise. OIDC_ALLOW_HTTP_ISSUER=true overrides this."
   case $FUSION_OIDC_REDIRECT_URI in
     https://* | http://localhost[:/]* | http://127.0.0.1[:/]*) ;;
     *) warn "the redirect URI is not HTTPS, so the login code and session cookie travel unencrypted." ;;
@@ -178,11 +189,9 @@ configure_oidc() {
   check_oidc_issuer "$FUSION_OIDC_ISSUER"
 
   # Without an allowed user, anyone who can log in at the issuer gets full access.
-  ask FUSION_OIDC_ALLOWED_USER "Only allow this user (their OIDC sub is safest; an email also works)" \
-    "$(kv_get "$CONFIG" FUSION_OIDC_ALLOWED_USER)"
+  ask FUSION_OIDC_ALLOWED_USER "Only allow this user (their OIDC sub is safest; an email also works)" "$saved_user"
   if [[ -z $FUSION_OIDC_ALLOWED_USER ]]; then
-    ask_bool OIDC_ALLOW_ANY_USER "Allow EVERY account at this issuer into Fusion?" \
-      "$(kv_get "$INSTALL" OIDC_ALLOW_ANY_USER | grep -x true || echo false)"
+    ask_bool OIDC_ALLOW_ANY_USER "Allow EVERY account at this issuer into Fusion?" "$any_default"
     $OIDC_ALLOW_ANY_USER ||
       die "set FUSION_OIDC_ALLOWED_USER, or OIDC_ALLOW_ANY_USER=true if every account at the issuer should have access"
     warn "every account at $FUSION_OIDC_ISSUER will be able to log in."
@@ -207,11 +216,11 @@ CONFIG="$STATE/config.env"
 SECRET="$STATE/secret.env"
 touch "$INSTALL" "$CONFIG" "$SECRET"
 
-# With OIDC on, an empty password still works at POST /api/sessions and makes the
-# Fever API key guessable, so empty-password mode is always refused.
+# Password login and the Fever API stay on with or without OIDC, so they always
+# get a real password.
 case "${FUSION_ALLOW_EMPTY_PASSWORD:-$(kv_get "$CONFIG" FUSION_ALLOW_EMPTY_PASSWORD)}" in
   '' | 0 | f | F | false | FALSE | False) ;;
-  *) die "FUSION_ALLOW_EMPTY_PASSWORD is not supported: Fusion would accept an empty password at login, even with OIDC on" ;;
+  *) die "FUSION_ALLOW_EMPTY_PASSWORD is not supported by this installer" ;;
 esac
 
 ask_secret FUSION_PASSWORD "Fusion password, used for login and Fever even with OIDC (blank = generate)" \
@@ -220,6 +229,8 @@ PASSWORD_GENERATED=false
 if [[ -z ${FUSION_PASSWORD//[[:space:]]/} ]]; then
   FUSION_PASSWORD=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
   PASSWORD_GENERATED=true
+elif ((${#FUSION_PASSWORD} < 12)); then
+  die "FUSION_PASSWORD must be at least 12 characters. Leave it blank to generate one."
 fi
 
 ask SERVICE_TYPE "Service type (ClusterIP, NodePort, LoadBalancer)" \
@@ -231,28 +242,48 @@ if [[ -n $PUBLIC_URL ]]; then
   require_match PUBLIC_URL "$PUBLIC_URL" '^https?://[^/[:space:]]+$' "a scheme and host, no path"
   ask FUSION_TRUSTED_PROXIES "Trusted proxy IPs/CIDRs, comma separated (your proxy pods)" \
     "$(kv_get "$CONFIG" FUSION_TRUSTED_PROXIES)"
+  [[ -n $FUSION_TRUSTED_PROXIES ]] ||
+    warn "no trusted proxies set. If a proxy fronts Fusion, all clients share one login rate limit, so bad logins from anyone lock out everyone."
 else
   FUSION_TRUSTED_PROXIES=''
 fi
 require_match SERVICE_TYPE "$SERVICE_TYPE" '^(ClusterIP|NodePort|LoadBalancer)$' "ClusterIP, NodePort or LoadBalancer"
-case ",${FUSION_TRUSTED_PROXIES// /}," in
-  *,0.0.0.0/0,* | *,::/0,*)
-    die "FUSION_TRUSTED_PROXIES must not trust every address: clients could spoof X-Forwarded-For to dodge the login rate limit" ;;
+# Too broad a range lets clients spoof X-Forwarded-For to dodge the login rate limit.
+IFS=, read -ra proxies <<<"${FUSION_TRUSTED_PROXIES// /}"
+for proxy in "${proxies[@]}"; do
+  [[ $proxy == */* ]] || continue
+  prefix=${proxy#*/}
+  min_prefix=8
+  [[ $proxy != *:* ]] || min_prefix=32
+  if ! [[ $prefix =~ ^[0-9]+$ ]] || ((10#$prefix < min_prefix)) || [[ ${proxy,,} == *ffff:* ]]; then
+    die "FUSION_TRUSTED_PROXIES entry \"$proxy\" is too broad"
+  fi
+done
+[[ $SERVICE_TYPE == ClusterIP ]] ||
+  warn "a $SERVICE_TYPE Service serves plain HTTP on its own port, so the password and session cookie can travel unencrypted."
+case $PUBLIC_URL in
+  '' | https://* | http://localhost | http://localhost:* | http://127.0.0.1 | http://127.0.0.1:*) ;;
+  *) warn "PUBLIC_URL isn't HTTPS, so the password and session cookie travel unencrypted." ;;
 esac
-[[ $SERVICE_TYPE == ClusterIP || $PUBLIC_URL == https://* ]] ||
-  warn "a $SERVICE_TYPE Service serves plain HTTP, so the password and session cookie travel unencrypted."
 
 # An empty list means Fusion allows every origin with credentials, and a list
 # without the real URL makes logins fail with 403, so derive it from the URL.
-if [[ -z ${FUSION_CORS_ALLOWED_ORIGINS+x} ]]; then
+# A list you set yourself is saved and wins until you set it to empty.
+CORS_OVERRIDE=${FUSION_CORS_ALLOWED_ORIGINS-$(kv_get "$INSTALL" CORS_OVERRIDE)}
+FUSION_CORS_ALLOWED_ORIGINS=$CORS_OVERRIDE
+if [[ -z $FUSION_CORS_ALLOWED_ORIGINS ]]; then
   FUSION_CORS_ALLOWED_ORIGINS="http://localhost:8080,http://127.0.0.1:8080"
   if [[ -n $PUBLIC_URL ]]; then
     FUSION_CORS_ALLOWED_ORIGINS="$PUBLIC_URL,$FUSION_CORS_ALLOWED_ORIGINS"
   elif [[ $SERVICE_TYPE != ClusterIP ]]; then
-    warn "no PUBLIC_URL set, so all origins are allowed. Set PUBLIC_URL for a $SERVICE_TYPE Service."
-    FUSION_CORS_ALLOWED_ORIGINS=''
+    die "a $SERVICE_TYPE Service needs PUBLIC_URL, or FUSION_CORS_ALLOWED_ORIGINS, so logins work from its address"
   fi
 fi
+IFS=, read -ra origins <<<"$FUSION_CORS_ALLOWED_ORIGINS"
+for origin in "${origins[@]}"; do
+  require_match FUSION_CORS_ALLOWED_ORIGINS "$origin" '^https?://[^/,[:space:]*]+$' \
+    "comma separated origins like https://host, with no spaces or wildcards"
+done
 
 oidc_default=false
 [[ -z ${FUSION_OIDC_ISSUER:-$(kv_get "$CONFIG" FUSION_OIDC_ISSUER)} ]] || oidc_default=true
@@ -275,7 +306,7 @@ FUSION_VERSION=${FUSION_VERSION:-$(kv_get "$INSTALL" FUSION_VERSION)}
 
 # --- Save state -----------------------------------------------------------------
 
-for key in ENABLE_OIDC OIDC_ALLOW_ANY_USER SERVICE_TYPE PUBLIC_URL \
+for key in ENABLE_OIDC OIDC_ALLOW_ANY_USER SERVICE_TYPE PUBLIC_URL CORS_OVERRIDE \
   STORAGE_SIZE STORAGE_CLASS FUSION_VERSION; do
   kv_set "$INSTALL" "$key" "${!key}"
 done
@@ -374,11 +405,16 @@ if ! kubectl -n "$NAMESPACE" rollout status deployment/fusion --timeout=180s; th
 fi
 
 # Each config change creates a new hash-named Secret. Remove the old ones so that
-# rotated credentials don't linger in the cluster.
+# rotated credentials don't linger in the cluster. A failure here doesn't hide the
+# report of a rollout that worked, but it does fail the run.
+CLEANUP_FAILED=''
+objects=$(kubectl -n "$NAMESPACE" get secret,configmap -l fusion.install/generated=true -o name) ||
+  CLEANUP_FAILED=' (could not list them)'
 while IFS= read -r object; do
   [[ -n $object ]] || continue
-  grep -q "^  name: ${object#*/}\$" "$RENDERED" || kubectl -n "$NAMESPACE" delete "$object"
-done < <(kubectl -n "$NAMESPACE" get secret,configmap -l fusion.install/generated=true -o name)
+  grep -q "^  name: ${object#*/}\$" "$RENDERED" ||
+    kubectl -n "$NAMESPACE" delete "$object" || CLEANUP_FAILED+=" $object"
+done <<<"${objects:-}"
 
 # --- Report ---------------------------------------------------------------------
 
@@ -389,3 +425,4 @@ info "  In the cluster: http://fusion.$NAMESPACE.svc"
 info "  Port-forward:   kubectl -n $NAMESPACE port-forward svc/fusion 8080:80, then http://localhost:8080"
 $PASSWORD_GENERATED && info "  Password:       generated and saved in $SECRET"
 if $ENABLE_OIDC; then info "  OIDC:           register this redirect URI with your provider: $FUSION_OIDC_REDIRECT_URI"; fi
+[[ -z $CLEANUP_FAILED ]] || die "Fusion is up, but these old objects, which may hold old credentials, could not be deleted:$CLEANUP_FAILED"
