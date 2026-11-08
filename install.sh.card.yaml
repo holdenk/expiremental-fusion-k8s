@@ -1,0 +1,10 @@
+card: 1
+name: install
+summary: "Interactive/env-driven Kubernetes installer for the Fusion RSS reader: renders kustomize with OIDC options, validates the OIDC issuer, keeps secrets in gitignored local state"
+language: shell
+kind: snippet
+license: unknown
+provenance:
+  authored_by: agent
+  agent: agent
+  human_reviewed: false
