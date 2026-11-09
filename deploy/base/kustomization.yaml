@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Expects a Secret `fusion-secrets` (FUSION_PASSWORD) and optionally a ConfigMap
+# `fusion-config`. install.sh generates both.
+resources:
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
